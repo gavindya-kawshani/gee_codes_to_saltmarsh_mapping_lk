@@ -1,0 +1,210 @@
+/// DEFINE REGION OF INTEREST (ROI)
+var roi = geometry;
+Map.centerObject(roi, 8);
+Map.addLayer(roi, {color: 'green'}, 'ROI', false);
+
+// DATA PREPARATION & SPLITTING
+var dataWithRandom = trainingPolygons.randomColumn({
+  columnName: 'random',
+  seed: 42
+});
+
+var binaryData = dataWithRandom
+  .filter(ee.Filter.notNull(['Class']))
+  .map(function(feature) {
+    var landcover = feature.get('Class');
+    var binaryClass = ee.Number(landcover).eq(1).toInt();
+    return feature.set('binary_class', binaryClass);
+  });
+
+var trainingSet   = binaryData.filter(ee.Filter.lt('random', 0.7));
+var validationSet = binaryData.filter(ee.Filter.gte('random', 0.7));
+
+// LOAD ALPHA EARTH EMBEDDINGS
+var year = 2024;
+var startDate = ee.Date.fromYMD(year, 1, 1);
+var endDate = startDate.advance(1, 'year');
+
+var embeddings = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL');
+
+var embeddingsImage = embeddings
+  .filter(ee.Filter.date(startDate, endDate))
+  .filter(ee.Filter.bounds(roi))
+  .mosaic();
+
+// ================================
+// APPLY ELEVATION MASK (<= 10 m)
+// ================================
+var srtm = ee.Image('USGS/SRTMGL1_003');
+var elevation = srtm.select('elevation');
+var elevationMask = elevation.lte(10);
+
+// Mask all areas above 10 m
+var embeddingsImage2 = embeddingsImage.updateMask(elevationMask);
+
+var inputBands = embeddingsImage2.bandNames();
+
+// SAMPLE PIXELS FROM EMBEDDINGS (Matched to Pixel/Object methodology)
+var trainingSamples = embeddingsImage2.sampleRegions({
+  collection: trainingSet,
+  properties: ['binary_class'],
+  scale: 30,
+  tileScale: 16,
+  geometries: false
+});
+
+var validationSamples = embeddingsImage2.sampleRegions({
+  collection: validationSet,
+  properties: ['binary_class'],
+  scale: 30,
+  tileScale: 16,
+  geometries: false
+});
+
+// TRAIN CLASSIFIER (Single training step)
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 100,
+  variablesPerSplit: null,
+  minLeafPopulation: 5,
+  bagFraction: 0.5,
+  maxNodes: null,
+  seed: 42
+}).train({
+  features: trainingSamples,
+  classProperty: 'binary_class',
+  inputProperties: inputBands
+});
+
+// CLASSIFICATION & PROBABILITY THRESHOLDING
+var clippedComposite = embeddingsImage2.clip(roi);
+
+var probability = clippedComposite.classify(
+  classifier.setOutputMode('PROBABILITY')
+);
+
+// Reset classifier back to CLASSIFICATION mode for validation
+classifier = classifier.setOutputMode('CLASSIFICATION');
+
+// Refine classification (>= 80% probability)
+var refinedClassification = probability.gte(0.80).rename('classification');
+
+// VISUALIZATION
+var saltmarshOnly = refinedClassification.eq(1).selfMask();
+Map.addLayer(saltmarshOnly, {palette: ['red']}, 'Alpha Earth Saltmarsh');
+
+// EXPORT to DRIVE 
+
+// Export.image.toDrive({
+//   image: saltmarshOnly,
+//   description: 'Refined_Model_03_AlphaEarth',
+//   scale: 30,
+//   region: roi,
+//   maxPixels: 1e13,
+//   fileFormat: 'GeoTIFF'
+// });
+
+
+// ACCURACY ASSESSMENT
+// ACCURACY ASSESSMENT (Alpha Earth - Standardized Print Layout)
+
+var validationClassified = validationSamples.classify(classifier);
+var errorMatrix = validationClassified.errorMatrix('binary_class', 'classification');
+
+var overallAccuracy = errorMatrix.accuracy();
+var kappa           = errorMatrix.kappa();
+
+var confusionArray = errorMatrix.array();
+var TN = confusionArray.get([0, 0]);
+var FP = confusionArray.get([0, 1]);
+var FN = confusionArray.get([1, 0]);
+var TP = confusionArray.get([1, 1]);
+
+var PA_nonMarsh = ee.Number(TN).divide(ee.Number(TN).add(FP));
+var PA_marsh    = ee.Number(TP).divide(ee.Number(TP).add(FN));
+var CA_nonMarsh = ee.Number(TN).divide(ee.Number(TN).add(FN));
+var CA_marsh    = ee.Number(TP).divide(ee.Number(TP).add(FP));
+
+var f1_marsh = ee.Number(2).multiply(PA_marsh).multiply(CA_marsh)
+  .divide(ee.Number(PA_marsh).add(CA_marsh));
+
+print('=== ACCURACY ASSESSMENT (Alpha Earth) ===');
+print('  Overall Accuracy:            ', overallAccuracy);
+print('  Kappa Coefficient:           ', kappa);
+print('  F1 Score (Saltmarsh):        ', f1_marsh);
+print('');
+print('  Producer\'s Accuracy:');
+print('    - Non-Marsh:               ', PA_nonMarsh);
+print('    - Saltmarsh:               ', PA_marsh);
+print('');
+print('  Consumer\'s Accuracy:');
+print('    - Non-Marsh:               ', CA_nonMarsh);
+print('    - Saltmarsh:               ', CA_marsh);
+print('');
+print('  Confusion Matrix:');
+print('    - TN:', TN, '  FP:', FP);
+print('    - FN:', FN, '  TP:', TP);
+// SALTMARSH AREA CALCULATION
+var areaImage = refinedClassification.eq(1).multiply(ee.Image.pixelArea());
+
+var stats = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30, // Aligned with other area calculations
+  tileScale: 16,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+
+var areaSqM = ee.Number(stats.get('classification'));
+var areaHectares = areaSqM.divide(10000);
+var areaSqKm    = areaSqM.divide(1000000);
+
+// 3. Wrap results into an unlocated Feature for CSV output
+var areaFeature = ee.Feature(null, {
+  'Model': 'Alpha Earth Pixel-Based',
+  'Area_SqM': areaSqM,
+  'Area_Hectares': areaHectares,
+  'Area_SqKm': areaSqKm,
+  'Scale_m': 30
+});
+
+// 4. Export to Google Drive
+// Export.table.toDrive({
+//   collection: ee.FeatureCollection([areaFeature]),
+//   description: 'AlphaEarth_Saltmarsh_Area_Export',
+//   fileFormat: 'CSV'
+// });
+
+// TRAINING DATA SUMMARY
+var trainSaltmarshPolygons    = trainingSet.filter(ee.Filter.eq('binary_class', 1));
+var trainNonSaltmarshPolygons = trainingSet.filter(ee.Filter.eq('binary_class', 0));
+var trainPixelsSaltmarsh    = trainingSamples.filter(ee.Filter.eq('binary_class', 1));
+var trainPixelsNonSaltmarsh = trainingSamples.filter(ee.Filter.eq('binary_class', 0));
+
+print('=== TRAINING DATASET SUMMARY ===');
+print('  Training Polygons:');
+print('    - Saltmarsh:               ', trainSaltmarshPolygons.size());
+print('    - Non-Saltmarsh:           ', trainNonSaltmarshPolygons.size());
+print('');
+print('  Training Pixel Samples:');
+print('    - Saltmarsh:               ', trainPixelsSaltmarsh.size());
+print('    - Non-Saltmarsh:           ', trainPixelsNonSaltmarsh.size());
+print('    - Total:                   ', trainingSamples.size());
+
+// VALIDATION DATA SUMMARY
+var valSaltmarshPolygons    = validationSet.filter(ee.Filter.eq('binary_class', 1));
+var valNonSaltmarshPolygons = validationSet.filter(ee.Filter.eq('binary_class', 0));
+var valPixelsSaltmarsh    = validationSamples.filter(ee.Filter.eq('binary_class', 1));
+var valPixelsNonSaltmarsh = validationSamples.filter(ee.Filter.eq('binary_class', 0));
+
+print('=== VALIDATION DATASET SUMMARY ===');
+print('  Validation Polygons:');
+print('    - Saltmarsh:               ', valSaltmarshPolygons.size());
+print('    - Non-Saltmarsh:           ', valNonSaltmarshPolygons.size());
+print('');
+print('  Validation Pixel Samples:');
+print('    - Saltmarsh:               ', valPixelsSaltmarsh.size());
+print('    - Non-Saltmarsh:           ', valPixelsNonSaltmarsh.size());
+print('    - Total:                   ', validationSamples.size());
+
+

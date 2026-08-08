@@ -1,0 +1,217 @@
+
+// DEFINE REGION OF INTEREST (ROI)
+var roi = geometry;
+//
+Map.centerObject(roi, 8);
+Map.addLayer(roi, {color: 'green'}, 'ROI', false);
+
+
+// DATA SPLITTING
+
+var dataWithRandom = trainingPolygons.randomColumn({
+  columnName: 'random',
+  seed: 42
+});
+
+var binaryData = dataWithRandom
+  .filter(ee.Filter.notNull(['Class']))
+  .map(function(feature) {
+    var landcover = ee.Number(feature.get('Class'));
+    var binaryClass = landcover.eq(1).toInt();
+    return feature.set('binary_class', binaryClass);
+  });
+
+// Split data: 70% training, 30% validation
+var trainingSet   = binaryData.filter(ee.Filter.lt('random', 0.7));
+var validationSet = binaryData.filter(ee.Filter.gte('random', 0.7));
+
+
+// SAMPLE PIXELS FROM COMPOSITE
+
+// SAMPLE PIXELS FROM COMPOSITE
+
+var inputBands = objectBasedComposite.bandNames();
+
+var trainingSamples = objectBasedComposite.sampleRegions({
+  collection: trainingSet,
+  properties: ['binary_class'],
+  scale: 30, 
+  tileScale: 16,
+  geometries: false
+})
+
+
+var validationSamples = objectBasedComposite.sampleRegions({
+  collection: validationSet,
+  properties: ['binary_class'],
+  scale: 30,
+  tileScale: 16,
+  geometries: false
+})
+
+// TRAIN CLASSIFIER - Random Forest
+
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 100,
+  variablesPerSplit: null,
+  minLeafPopulation: 5,
+  bagFraction: 0.5,
+  maxNodes: null,
+  seed: 42
+}).train({
+  features: trainingSamples,
+  classProperty: 'binary_class',
+  inputProperties: inputBands
+});
+
+
+// OBJECT-BASED CLASSIFICATION
+
+//Clip to ROI first
+var clippedComposite = objectBasedComposite.clip(roi);
+
+// Single classify() pass
+var probability = clippedComposite.classify(
+  classifier.setOutputMode('PROBABILITY')
+);
+classifier = classifier.setOutputMode('CLASSIFICATION');
+
+// POST-PROCESSING AND REFINEMENT
+
+var refinedClassification = probability.gte(0.8).rename('classification');
+
+// VISUALIZATION
+
+var displayImage = refinedClassification;
+
+// Map.addLayer(displayImage,
+//   {min: 0, max: 1, palette: ['gray', 'red']},
+//   'Final Tidal Marsh Classification (Object-Based)');
+  
+//Visualize saltmarsh only
+var saltmarshOnly = refinedClassification.eq(1).selfMask();
+
+Map.addLayer(
+  saltmarshOnly,
+  {palette: ['red']},
+  'Saltmarsh Only'
+);
+
+//EXPORT TO DRIVE 
+
+// Export.image.toDrive({
+//   image: saltmarshOnly,
+//   description: 'Refined_Model_Objectbased_RF_SM',
+//   scale: 30,
+//   region: roi,
+//   maxPixels: 1e13,
+//   fileFormat: 'GeoTIFF'
+// });
+
+
+// ACCURACY ASSESSMENT
+
+var validationClassified = validationSamples.classify(classifier);
+var errorMatrix = validationClassified.errorMatrix('binary_class', 'classification');
+
+var overallAccuracy   = errorMatrix.accuracy();
+var kappa             = errorMatrix.kappa();
+var producersAccuracy = errorMatrix.producersAccuracy();
+var consumersAccuracy = errorMatrix.consumersAccuracy();
+
+var confusionArray = errorMatrix.array();
+var TN = confusionArray.get([0, 0]);
+var FP = confusionArray.get([0, 1]);
+var FN = confusionArray.get([1, 0]);
+var TP = confusionArray.get([1, 1]);
+
+var PA_nonMarsh = ee.Number(TN).divide(ee.Number(TN).add(FP));
+var PA_marsh    = ee.Number(TP).divide(ee.Number(TP).add(FN));
+var CA_nonMarsh = ee.Number(TN).divide(ee.Number(TN).add(FN));
+var CA_marsh    = ee.Number(TP).divide(ee.Number(TP).add(FP));
+
+var f1_marsh = ee.Number(2).multiply(PA_marsh).multiply(CA_marsh)
+  .divide(ee.Number(PA_marsh).add(CA_marsh));
+
+
+
+// SALTMARSH AREA CALCULATION
+
+var areaImage = refinedClassification.eq(1).multiply(ee.Image.pixelArea());
+
+var stats = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  // We use 30m here just for the area math to save memory, 
+  // but the actual classification on the map remains at 30m!
+  scale: 30, 
+  maxPixels: 1e13,
+  bestEffort: true
+});
+
+var areaSqM         = ee.Number(stats.get('classification'));
+var areaHectares    = areaSqM.divide(10000);
+var areaSqKm        = areaSqM.divide(1000000);
+
+var roiArea         = ee.Number(ee.Geometry(roi).area({maxError: 100}));
+var percentageOfROI = areaSqM.divide(roiArea).multiply(100);
+
+// PRINT RESULTS
+
+print('=== ACCURACY ASSESSMENT ===');
+print('  Overall Accuracy:            ', overallAccuracy);
+print('  Kappa Coefficient:           ', kappa);
+print('  F1 Score (Saltmarsh):        ', f1_marsh);
+print('');
+print('  Producer\'s Accuracy:');
+print('    - Non-Marsh:               ', PA_nonMarsh);
+print('    - Saltmarsh:               ', PA_marsh);
+print('');
+print('  Consumer\'s Accuracy:');
+print('    - Non-Marsh:               ', CA_nonMarsh);
+print('    - Saltmarsh:               ', CA_marsh);
+print('');
+print('  Confusion Matrix:');
+print('    - TN:', TN, '  FP:', FP);
+print('    - FN:', FN, '  TP:', TP);
+print('');
+print('=== SALTMARSH AREA ===');
+print('  Hectares:                    ', areaHectares);
+//print('  Square kilometers:           ', areaSqKm);
+//print('  Percentage of ROI:           ', percentageOfROI, '%');
+
+
+print("Training samples:", trainingSamples.size());
+print("Validation samples:", validationSamples.size());
+
+// TRAINING DATA SUMMARY
+var trainSaltmarshPolygons    = trainingSet.filter(ee.Filter.eq('binary_class', 1));
+var trainNonSaltmarshPolygons = trainingSet.filter(ee.Filter.eq('binary_class', 0));
+var trainPixelsSaltmarsh    = trainingSamples.filter(ee.Filter.eq('binary_class', 1));
+var trainPixelsNonSaltmarsh = trainingSamples.filter(ee.Filter.eq('binary_class', 0));
+
+print('=== TRAINING DATASET SUMMARY ===');
+print('  Training Polygons:');
+print('    - Saltmarsh:               ', trainSaltmarshPolygons.size());
+print('    - Non-Saltmarsh:           ', trainNonSaltmarshPolygons.size());
+print('');
+print('  Training Pixel Samples:');
+print('    - Saltmarsh:               ', trainPixelsSaltmarsh.size());
+print('    - Non-Saltmarsh:           ', trainPixelsNonSaltmarsh.size());
+print('    - Total:                   ', trainingSamples.size());
+
+// VALIDATION DATA SUMMARY
+var valSaltmarshPolygons    = validationSet.filter(ee.Filter.eq('binary_class', 1));
+var valNonSaltmarshPolygons = validationSet.filter(ee.Filter.eq('binary_class', 0));
+var valPixelsSaltmarsh    = validationSamples.filter(ee.Filter.eq('binary_class', 1));
+var valPixelsNonSaltmarsh = validationSamples.filter(ee.Filter.eq('binary_class', 0));
+
+print('=== VALIDATION DATASET SUMMARY ===');
+print('  Validation Polygons:');
+print('    - Saltmarsh:               ', valSaltmarshPolygons.size());
+print('    - Non-Saltmarsh:           ', valNonSaltmarshPolygons.size());
+print('');
+print('  Validation Pixel Samples:');
+print('    - Saltmarsh:               ', valPixelsSaltmarsh.size());
+print('    - Non-Saltmarsh:           ', valPixelsNonSaltmarsh.size());
+print('    - Total:                   ', validationSamples.size());

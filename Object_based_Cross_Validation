@@ -1,0 +1,425 @@
+// ##############################################################################
+// OBJECT-BASED SALTMARSH MAPPING WITH SPATIAL CROSS-VALIDATION (GEE)
+// ##############################################################################
+//
+// WHAT THIS SCRIPT DOES
+//   1. Trains a Random Forest on your object-based composite (objectBasedComposite)
+//   2. Estimates accuracy with SPATIAL cross-validation (not a random 70/30 split)
+//   3. Exports a saltmarsh probability + class map
+//   4. Lets you reload that map and export saltmarsh area
+//
+// WHY SPATIAL CV?  (important for beginners)
+//   A normal random train/test split often puts nearby pixels in BOTH sets.
+//   Because nearby places look similar, accuracy looks artificially high.
+//   Spatial CV divides the study area into geographic BLOCKS (grid cells),
+//   assigns whole blocks to folds, and always tests on blocks the model
+//   never saw. Accuracy is usually LOWER — that is expected and more honest.
+//
+// HOW TO RUN (two modes — do not skip steps)
+//   STEP 1 — mode = 'export'
+//            Click Run. Open the Tasks tab. Click RUN on each listed task.
+//            Wait until the Classification Asset task finishes (Assets tab).
+//   STEP 2 — mode = 'view'
+//            Click Run again. The map loads from the saved asset.
+//            Run the Area task(s) in Tasks for hectares / km² (CSV to Drive).
+//
+// YOU MUST ALREADY HAVE IN THIS SCRIPT (or Imports):
+//   - geometry              → your region of interest (ROI)
+//   - trainingPolygons      → training data with property 'Class'
+//                             (1 = saltmarsh, other = non-saltmarsh)
+//   - objectBasedComposite  → your object-based predictor image (segment stats)
+//
+// FAIR COMPARISON with pixel-based and Alpha Earth scripts:
+//   Keep the EDIT ME settings below the SAME in all three scripts
+//   (resolution, folds, threshold, sample caps, trees).
+//   Only the predictor image differs between methods.
+//
+// ##############################################################################
+
+// ==============================================================================
+// >>> EDIT ME — settings you (or your colleague) should check before running <<<
+// ==============================================================================
+
+// --- Mode switch --------------------------------------------------------------
+// 'export' = train model, run spatial CV, save map (do this FIRST)
+// 'view'   = load saved map + queue area export (do this AFTER asset exists)
+var mode = 'view';
+
+// --- Where to save / load the map (Earth Engine Asset) ------------------------
+// Change YOUR_USERNAME to your GEE username, e.g. 'users/ed726/...'
+var outputAssetId = 'projects/my-project-habitat-mapping/assets/objectbasedRF_saltmarsh_spatial_cv';
+
+// --- Resolution (metres) ------------------------------------------------------
+// Pixel size for sampling predictors, exporting the map, and official area.
+// 30 = 30 m × 30 m pixels. Use the SAME value in all three comparison scripts.
+var resolutionMeters = 30;
+
+// --- Saltmarsh decision threshold ---------------------------------------------
+// Pixel is mapped as saltmarsh if probability >= this value.
+// Use the SAME value in pixel-based and Alpha Earth scripts for fair comparison.
+var probThreshold = 0.80;
+
+// --- Spatial CV design --------------------------------------------------------
+var nFolds = 5;                 // number of geographic folds (usually 5)
+var blockSizeDegrees = 0.15;    // ~15 km grid cells (0.1≈10 km, 0.2≈20 km)
+
+// --- Training sample size (keeps GEE from running out of memory) --------------
+var maxPointsPerClass = 2500;   // max random points per class (try 1500 if Tasks fail)
+var pointsPerPolygon = 15;      // max random points drawn inside each polygon
+var pointSeed = 42;             // keeps random points reproducible
+
+// --- Random Forest ------------------------------------------------------------
+var numberOfTrees = 100;
+
+// --- Optional exports ---------------------------------------------------------
+var exportDriveGeoTiff = false; // true = also save a GeoTIFF to Google Drive
+var exportRoughAreaKm = true;   // in view mode: also export a fast ~1 km area estimate
+
+
+// ==============================================================================
+// FIXED HELPERS (you usually do not need to edit below this line)
+// ==============================================================================
+var tileScale = 16; // GEE memory helper; raise to 32 if an Export fails with memory errors
+var roi = geometry;
+
+Map.centerObject(roi, 8);
+Map.addLayer(roi, {color: 'green'}, 'ROI', false);
+
+print('=== MODE:', mode, '===');
+print('Resolution:', resolutionMeters, 'm | Threshold:', probThreshold,
+      '| Folds:', nFolds, '| Block ~', blockSizeDegrees, 'degrees');
+
+
+// ##############################################################################
+//
+//  MODE = 'view'
+//  Load the saved map. Queue area CSVs. Does NOT retrain the model.
+//
+// ##############################################################################
+if (mode === 'view') {
+
+  print('');
+  print('VIEW MODE');
+  print('  - Shows probability + saltmarsh class from the Asset');
+  print('  - Area is calculated from that saved map (no Random Forest re-run)');
+  print('  - Do not expect area in the Console — use Tasks → CSV');
+  print('  - Asset must already exist:', outputAssetId);
+
+  var saved = ee.Image(outputAssetId);
+  var probability = saved.select('probability');
+  var saltmarsh = probability.gte(probThreshold).rename('classification');
+
+  Map.addLayer(
+    probability,
+    {min: 0, max: 1, palette: ['#f7fcf5', '#00441b']},
+    'Probability (from asset)'
+  );
+  Map.addLayer(
+    saltmarsh.selfMask(),
+    {palette: ['red']},
+    'Saltmarsh (prob >= ' + probThreshold + ')'
+  );
+
+  function makeAreaRow(scaleMeters, label) {
+    var areaM2 = ee.Number(
+      saltmarsh.multiply(ee.Image.pixelArea()).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: roi,
+        scale: scaleMeters,
+        tileScale: tileScale,
+        maxPixels: 1e13,
+        bestEffort: true
+      }).get('classification')
+    );
+    return ee.Feature(null, {
+      model: 'object_spatial_cv',
+      label: label,
+      area_m2: areaM2,
+      area_ha: areaM2.divide(10000),
+      area_km2: areaM2.divide(1e6),
+      scale_m: scaleMeters,
+      prob_threshold: probThreshold,
+      asset: outputAssetId
+    });
+  }
+
+  Export.table.toDrive({
+    collection: ee.FeatureCollection([
+      makeAreaRow(resolutionMeters, 'official_' + resolutionMeters + 'm')
+    ]),
+    description: 'Object_SpatialCV_Area_' + resolutionMeters + 'm',
+    fileFormat: 'CSV'
+  });
+  print('Task queued: Object_SpatialCV_Area_' + resolutionMeters + 'm  (official)');
+
+  if (exportRoughAreaKm) {
+    Export.table.toDrive({
+      collection: ee.FeatureCollection([makeAreaRow(1000, 'rough_1000m')]),
+      description: 'Object_SpatialCV_Area_1000m_rough',
+      fileFormat: 'CSV'
+    });
+    print('Task queued: Object_SpatialCV_Area_1000m_rough  (approximate, faster)');
+  }
+
+  print('');
+  print('Next: Tasks tab → RUN the area task(s) → open CSV in Drive');
+  print('Accuracy numbers: use FoldMetrics / Summary CSVs from export mode');
+
+
+// ##############################################################################
+//
+//  MODE = 'export'
+//  Spatial CV accuracy + final map asset. Heavy work runs as Tasks (not Console).
+//
+// ##############################################################################
+} else {
+
+  // METHOD STEP 1 — Labels + spatial grid cell id
+  var labeled = trainingPolygons
+    .filter(ee.Filter.notNull(['Class']))
+    .map(function(feature) {
+      var xy = feature.geometry().centroid(1).coordinates();
+      var col = ee.Number(xy.get(0)).divide(blockSizeDegrees).floor().toInt();
+      var row = ee.Number(xy.get(1)).divide(blockSizeDegrees).floor().toInt();
+      var gridId = ee.String(col.format('%d')).cat('_').cat(row.format('%d'));
+      return feature.set({
+        grid_id: gridId,
+        binary_class: ee.Number(feature.get('Class')).eq(1).toInt()
+      });
+    });
+
+  // METHOD STEP 2 — Balance folds across grid cells
+  var cellGroups = ee.List(
+    ee.Dictionary(
+      labeled.reduceColumns({
+        reducer: ee.Reducer.frequencyHistogram().group({
+          groupField: 0,
+          groupName: 'grid_id'
+        }),
+        selectors: ['grid_id', 'binary_class']
+      })
+    ).get('groups')
+  );
+
+  function assignGroupsToFolds(groups, nFolds) {
+    var foldTotals = [];
+    var i, c, f;
+    for (i = 0; i < nFolds; i++) foldTotals.push([0, 0]);
+
+    var items = groups.slice().sort(function(a, b) { return b.total - a.total; });
+    var assignments = {};
+
+    for (i = 0; i < items.length; i++) {
+      var counts = items[i].counts;
+      var fold = i < nFolds ? i : 0;
+      if (i >= nFolds) {
+        var best = Infinity;
+        for (f = 0; f < nFolds; f++) {
+          var s0 = foldTotals[f][0] + counts[0];
+          var s1 = foldTotals[f][1] + counts[1];
+          var sum = s0 + s1;
+          var mean = sum / 2;
+          var std = Math.sqrt((Math.pow(s0 - mean, 2) + Math.pow(s1 - mean, 2)) / 2);
+          var score = sum + std;
+          if (score < best) { best = score; fold = f; }
+        }
+      }
+      assignments[items[i].grid_id] = fold;
+      foldTotals[fold][0] += counts[0];
+      foldTotals[fold][1] += counts[1];
+    }
+    return {assignments: assignments, foldTotals: foldTotals};
+  }
+
+  print('EXPORT MODE — building spatial folds (lightweight)...');
+  cellGroups.evaluate(function(groups) {
+    if (!groups || !groups.length) {
+      print('ERROR: no training polygons with Class. Check trainingPolygons.');
+      return;
+    }
+
+    var parsed = groups.map(function(g) {
+      var hist = g.histogram || {};
+      var c0 = hist['0'] || hist[0] || 0;
+      var c1 = hist['1'] || hist[1] || 0;
+      return {grid_id: g.grid_id, counts: [c0, c1], total: c0 + c1};
+    });
+
+    var result = assignGroupsToFolds(parsed, nFolds);
+    print('Number of grid cells:', parsed.length);
+    for (var f = 0; f < nFolds; f++) {
+      print('Fold', f, '→ background polygons:', result.foldTotals[f][0],
+            '| saltmarsh polygons:', result.foldTotals[f][1]);
+    }
+    queueExports(result.assignments);
+  });
+
+  function queueExports(assignments) {
+    var foldDict = ee.Dictionary(assignments);
+
+    var withFolds = labeled.map(function(f) {
+      return f.set('fold', ee.Number(foldDict.get(f.get('grid_id'))).toInt());
+    });
+    Map.addLayer(withFolds, {color: 'cyan'}, 'Training polygons', false);
+
+    // STEP 3 — Capped random points inside polygons
+    var candidatePoints = withFolds.map(function(feature) {
+      var geom = feature.geometry();
+      var n = geom.area(1).divide(10000).divide(5).ceil()
+        .min(pointsPerPolygon).max(1).toInt();
+      return ee.FeatureCollection.randomPoints({
+        region: geom, points: n, seed: pointSeed
+      }).map(function(pt) {
+        return pt.set({
+          binary_class: feature.get('binary_class'),
+          fold: feature.get('fold'),
+          grid_id: feature.get('grid_id')
+        });
+      });
+    }).flatten();
+
+    function capClass(cls) {
+      return candidatePoints
+        .filter(ee.Filter.eq('binary_class', cls))
+        .randomColumn('r', pointSeed)
+        .sort('r')
+        .limit(maxPointsPerClass);
+    }
+    var trainPoints = capClass(0).merge(capClass(1));
+
+    // STEP 4 — Extract object-based predictor values at those points
+    var predictors = objectBasedComposite.clip(roi);
+    var bands = predictors.bandNames();
+    var samples = predictors.sampleRegions({
+      collection: trainPoints,
+      properties: ['binary_class', 'fold', 'grid_id'],
+      scale: resolutionMeters,
+      tileScale: tileScale,
+      geometries: false
+    });
+
+    function trainRf(feats) {
+      return ee.Classifier.smileRandomForest({
+        numberOfTrees: numberOfTrees,
+        minLeafPopulation: 5,
+        bagFraction: 0.5,
+        seed: 42
+      }).train({
+        features: feats,
+        classProperty: 'binary_class',
+        inputProperties: bands
+      });
+    }
+
+    // STEP 5 — Spatial CV
+    var metricFeatures = [];
+    for (var k = 0; k < nFolds; k++) {
+      var train = samples.filter(ee.Filter.neq('fold', k));
+      var test = samples.filter(ee.Filter.eq('fold', k));
+
+      var tested = test.classify(trainRf(train).setOutputMode('PROBABILITY'))
+        .map(function(f) {
+          var p = ee.Number(f.get('classification'));
+          return f.set('pred', p.gte(probThreshold).toInt());
+        });
+
+      var em = tested.errorMatrix('binary_class', 'pred');
+      var a = em.array();
+      var tp = ee.Number(a.get([1, 1]));
+      var fp = ee.Number(a.get([0, 1]));
+      var fn = ee.Number(a.get([1, 0]));
+      var tn = ee.Number(a.get([0, 0]));
+      var pa = ee.Number(ee.Algorithms.If(tp.add(fn).eq(0), 0, tp.divide(tp.add(fn))));
+      var ca = ee.Number(ee.Algorithms.If(tp.add(fp).eq(0), 0, tp.divide(tp.add(fp))));
+      var f1 = ee.Number(ee.Algorithms.If(
+        pa.add(ca).eq(0), 0, ee.Number(2).multiply(pa).multiply(ca).divide(pa.add(ca))
+      ));
+
+      metricFeatures.push(ee.Feature(null, {
+        fold: k,
+        overall_accuracy: em.accuracy(),
+        kappa: em.kappa(),
+        f1_saltmarsh: f1,
+        producers_acc_marsh: pa,
+        consumers_acc_marsh: ca,
+        TP: tp, FP: fp, FN: fn, TN: tn,
+        n_train: train.size(),
+        n_test: test.size(),
+        resolution_m: resolutionMeters,
+        prob_threshold: probThreshold,
+        model: 'object_objectBasedComposite'
+      }));
+    }
+
+    var cvMetrics = ee.FeatureCollection(metricFeatures);
+
+    Export.table.toDrive({
+      collection: cvMetrics,
+      description: 'Object_SpatialCV_FoldMetrics',
+      fileFormat: 'CSV'
+    });
+    Export.table.toDrive({
+      collection: ee.FeatureCollection([ee.Feature(null, {
+        model: 'object_spatial_cv',
+        mean_OA: cvMetrics.aggregate_mean('overall_accuracy'),
+        mean_Kappa: cvMetrics.aggregate_mean('kappa'),
+        mean_F1: cvMetrics.aggregate_mean('f1_saltmarsh'),
+        n_folds: nFolds,
+        resolution_m: resolutionMeters,
+        block_size_deg: blockSizeDegrees,
+        prob_threshold: probThreshold,
+        max_points_per_class: maxPointsPerClass,
+        number_of_trees: numberOfTrees
+      })]),
+      description: 'Object_SpatialCV_Summary',
+      fileFormat: 'CSV'
+    });
+
+    // STEP 6 — Final map on all samples
+    var probability = predictors.classify(
+      trainRf(samples).setOutputMode('PROBABILITY')
+    ).rename('probability');
+
+    var classification = probability.gte(probThreshold)
+      .rename('classification')
+      .toFloat();
+
+    var exportImage = probability.addBands(classification);
+
+    Export.image.toAsset({
+      image: exportImage,
+      description: 'Object_SpatialCV_Classification_Asset',
+      assetId: outputAssetId,
+      region: roi,
+      scale: resolutionMeters,
+      maxPixels: 1e13,
+      pyramidingPolicy: {probability: 'mean', classification: 'mode'}
+    });
+
+    if (exportDriveGeoTiff) {
+      Export.image.toDrive({
+        image: exportImage,
+        description: 'Object_SpatialCV_Classification_Drive',
+        folder: 'GEE_exports',
+        fileNamePrefix: 'object_saltmarsh_spatial_cv',
+        region: roi,
+        scale: resolutionMeters,
+        maxPixels: 1e13,
+        fileFormat: 'GeoTIFF'
+      });
+    }
+
+    print('');
+    print('EXPORT MODE — Tasks to RUN (Tasks tab):');
+    print('  1) Object_SpatialCV_FoldMetrics     → accuracy per fold');
+    print('  2) Object_SpatialCV_Summary         → mean OA / Kappa / F1');
+    print('  3) Object_SpatialCV_Classification_Asset → map at', resolutionMeters, 'm');
+    if (exportDriveGeoTiff) {
+      print('  4) Object_SpatialCV_Classification_Drive → optional GeoTIFF');
+    }
+    print('');
+    print('When the Asset task is COMPLETED:');
+    print('  set mode = \'view\', Run again, then run the Area task(s).');
+    print('If a Task fails with memory errors: lower maxPointsPerClass to 1500.');
+  }
+}
